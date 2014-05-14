@@ -23,29 +23,20 @@ ifneq ($(filter apq8084,$(TARGET_BOARD_PLATFORM)),)
 endif
 endif
 
-ifeq ($(TARGET_BOARD_PLATFORM),msm8960)
-  LOCAL_CFLAGS := -DPLATFORM_MSM8960
-  ifneq ($(BOARD_HAVE_NEW_QCOM_CSDCLIENT), true)
-    AUDIO_FEATURE_DISABLED_MULTI_VOICE_SESSIONS := true
-  endif
-endif
-
 LOCAL_SRC_FILES := \
 	audio_hw.c \
 	voice.c \
 	platform_info.c \
 	$(AUDIO_PLATFORM)/platform.c
 
-ifneq ($(BOARD_USES_CUSTOM_AUDIO_PLATFORM_PATH),)
-    LOCAL_SRC_FILES += ../../../../$(BOARD_USES_CUSTOM_AUDIO_PLATFORM_PATH)/customplatform.c
-else
-    LOCAL_SRC_FILES += vendor-platform/customplatform.c
-endif
-
 LOCAL_SRC_FILES += audio_extn/audio_extn.c
 
 ifneq ($(strip $(AUDIO_FEATURE_DISABLED_ANC_HEADSET)),true)
     LOCAL_CFLAGS += -DANC_HEADSET_ENABLED
+endif
+
+ifneq ($(strip $(AUDIO_FEATURE_DISABLED_FLUENCE)),true)
+    LOCAL_CFLAGS += -DFLUENCE_ENABLED
 endif
 
 ifneq ($(strip $(AUDIO_FEATURE_DISABLED_PROXY_DEVICE)),true)
@@ -66,7 +57,11 @@ ifneq ($(strip $(AUDIO_FEATURE_DISABLED_HFP)),true)
     LOCAL_SRC_FILES += audio_extn/hfp.c
 endif
 
-ifeq ($(strip $(AUDIO_FEATURE_ENABLED_SSR)),true)
+ifneq ($(strip $(AUDIO_FEATURE_DISABLED_CUSTOMSTEREO)),true)
+    LOCAL_CFLAGS += -DCUSTOM_STEREO_ENABLED
+endif
+
+ifneq ($(strip $(AUDIO_FEATURE_DISABLED_SSR)),true)
     LOCAL_CFLAGS += -DSSR_ENABLED
     LOCAL_SRC_FILES += audio_extn/ssr.c
     LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/mm-audio/surround_sound/
@@ -81,18 +76,15 @@ ifneq ($(strip $(AUDIO_FEATURE_DISABLED_MULTI_VOICE_SESSIONS)),true)
 ifneq ($(strip $(AUDIO_FEATURE_DISABLED_INCALL_MUSIC)),true)
     LOCAL_CFLAGS += -DINCALL_MUSIC_ENABLED
 endif
-endif
 
-ifneq ($(filter msm8974 msm8226,$(TARGET_BOARD_PLATFORM)),)
 ifneq ($(strip $(AUDIO_FEATURE_DISABLED_COMPRESS_VOIP)),true)
-
     LOCAL_CFLAGS += -DCOMPRESS_VOIP_ENABLED
     LOCAL_SRC_FILES += voice_extn/compress_voip.c
 endif
 endif
 
 ifneq ($(strip, $(AUDIO_FEATURE_DISABLED_SPKR_PROTECTION)),true)
-ifneq ($(filter msm8974 msm8226,$(TARGET_BOARD_PLATFORM)),)
+ifneq ($(filter msm8974 apq8084,$(TARGET_BOARD_PLATFORM)),)
     LOCAL_CFLAGS += -DSPKR_PROT_ENABLED
     LOCAL_SRC_FILES += audio_extn/spkr_protection.c
     LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
@@ -105,27 +97,25 @@ ifdef MULTIPLE_HW_VARIANTS_ENABLED
   LOCAL_SRC_FILES += $(AUDIO_PLATFORM)/hw_info.c
 endif
 
-ifneq ($(filter msm8974 msm8226,$(TARGET_BOARD_PLATFORM)),)
 ifneq ($(strip $(AUDIO_FEATURE_DISABLED_COMPRESS_CAPTURE)),true)
     LOCAL_CFLAGS += -DCOMPRESS_CAPTURE_ENABLED
     LOCAL_SRC_FILES += audio_extn/compress_capture.c
 endif
-endif
 
-ifneq ($(filter msm8974 msm8226,$(TARGET_BOARD_PLATFORM)),)
 ifneq ($(strip $(AUDIO_FEATURE_DISABLED_DS1_DOLBY_DDP)),true)
     LOCAL_CFLAGS += -DDS1_DOLBY_DDP_ENABLED
     LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
     LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
     LOCAL_SRC_FILES += audio_extn/dolby.c
 endif
+
+ifneq ($(strip $(AUDIO_FEATURE_DISABLED_DS1_DOLBY_DAP)),true)
+    LOCAL_CFLAGS += -DDS1_DOLBY_DAP_ENABLED
+ifeq ($(strip $(AUDIO_FEATURE_DISABLED_DS1_DOLBY_DDP)),true)
+    LOCAL_SRC_FILES += audio_extn/dolby.c
+endif
 endif
 
-ifneq ($(filter msm8974 msm8226,$(TARGET_BOARD_PLATFORM)),)
-ifeq ($(strip $(AUDIO_FEATURE_SEPARATE_SPKR_BACKEND)),true)
-    LOCAL_CFLAGS += -DSEPARATE_SPKR_BACKEND
-endif
-endif
 
 LOCAL_SHARED_LIBRARIES := \
 	liblog \
@@ -134,7 +124,8 @@ LOCAL_SHARED_LIBRARIES := \
 	libtinycompress \
 	libaudioroute \
 	libdl \
-	libexpat
+	libexpat \
+        libmdmdetect
 
 LOCAL_C_INCLUDES += \
 	external/tinyalsa/include \
@@ -145,7 +136,7 @@ LOCAL_C_INCLUDES += \
 	$(LOCAL_PATH)/$(AUDIO_PLATFORM) \
 	$(LOCAL_PATH)/audio_extn \
 	$(LOCAL_PATH)/voice_extn \
-	$(LOCAL_PATH)/vendor-platform
+        $(TARGET_OUT_HEADERS)/libmdmdetect/inc
 
 ifeq ($(strip $(AUDIO_FEATURE_ENABLED_LISTEN)),true)
     LOCAL_CFLAGS += -DAUDIO_LISTEN_ENABLED

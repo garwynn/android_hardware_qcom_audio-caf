@@ -106,6 +106,7 @@ int start_call(struct audio_device *adev, audio_usecase_t usecase_id)
     int i, ret = 0;
     struct audio_usecase *uc_info;
     int pcm_dev_rx_id, pcm_dev_tx_id;
+    uint32_t sample_rate = 8000;
     struct voice_session *session = NULL;
     struct pcm_config voice_config = pcm_config_voice_call;
 
@@ -133,6 +134,13 @@ int start_call(struct audio_device *adev, audio_usecase_t usecase_id)
         ret = -EIO;
         goto error_start_voice;
     }
+    ret = platform_get_sample_rate(adev->platform, &sample_rate);
+    if (ret < 0) {
+        ALOGE("platform_get_sample_rate error %d\n", ret);
+    } else {
+        voice_config.rate = sample_rate;
+    }
+    ALOGD("voice_config.rate %d\n", voice_config.rate);
 
     ALOGV("%s: Opening PCM playback device card_id(%d) device_id(%d)",
           __func__, adev->snd_card, pcm_dev_rx_id);
@@ -189,7 +197,6 @@ bool voice_is_in_call(struct audio_device *adev)
     return in_call;
 }
 
-#ifdef MULTI_VOICE_SESSION_ENABLED
 uint32_t voice_get_active_session_id(struct audio_device *adev)
 {
     int ret = 0;
@@ -281,7 +288,6 @@ int voice_check_and_set_incall_music_usecase(struct audio_device *adev,
 
     return ret;
 }
-#endif
 
 int voice_set_mic_mute(struct audio_device *adev, bool state)
 {
@@ -374,11 +380,9 @@ int voice_set_parameters(struct audio_device *adev, struct str_parms *parms)
     if (ret != 0)
         goto done;
 
-#ifdef COMPRESS_VOIP_ENABLED
     ret = voice_extn_compress_voip_set_parameters(adev, parms);
     if (ret != 0)
         goto done;
-#endif
 
     err = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_TTY_MODE, value, sizeof(value));
     if (err >= 0) {
@@ -405,7 +409,6 @@ int voice_set_parameters(struct audio_device *adev, struct str_parms *parms)
         }
     }
 
-#ifdef INCALL_MUSIC_ENABLED
     err = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_INCALLMUSIC,
                             value, sizeof(value));
     if (err >= 0) {
@@ -415,7 +418,6 @@ int voice_set_parameters(struct audio_device *adev, struct str_parms *parms)
         else
             platform_stop_incall_music_usecase(adev->platform);
      }
-#endif
 
 done:
     ALOGV("%s: exit with code(%d)", __func__, ret);

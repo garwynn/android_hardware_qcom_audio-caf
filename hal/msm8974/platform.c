@@ -31,10 +31,16 @@
 #include "platform.h"
 #include "audio_extn.h"
 #include "voice_extn.h"
+#include "mdm_detect.h"
 #include "sound/compress_params.h"
 
 #define MIXER_XML_PATH "/system/etc/mixer_paths.xml"
 #define MIXER_XML_PATH_AUXPCM "/system/etc/mixer_paths_auxpcm.xml"
+#define MIXER_XML_PATH_I2S "/system/etc/mixer_paths_i2s.xml"
+
+#define PLATFORM_INFO_XML_PATH      "/system/etc/audio_platform_info.xml"
+#define PLATFORM_INFO_XML_PATH_I2S  "/system/etc/audio_platform_info_i2s.xml"
+
 #define LIB_ACDB_LOADER "libacdbloader.so"
 #define AUDIO_DATA_BLOCK_MIXER_CTL "HDMI EDID"
 
@@ -73,6 +79,9 @@
 #define RETRY_US 500000
 #define MAX_SND_CARD 8
 
+#define SAMPLE_RATE_8KHZ  8000
+#define SAMPLE_RATE_16KHZ 16000
+
 #define AUDIO_PARAMETER_KEY_FLUENCE_TYPE  "fluence"
 #define AUDIO_PARAMETER_KEY_BTSCO         "bt_samplerate"
 #define AUDIO_PARAMETER_KEY_SLOWTALK      "st_enable"
@@ -87,6 +96,38 @@ struct audio_block_header
 {
     int reserved;
     int length;
+};
+
+/* Audio calibration related functions */
+typedef void (*acdb_deallocate_t)();
+typedef int  (*acdb_init_t)(char *);
+typedef void (*acdb_send_audio_cal_t)(int, int);
+typedef void (*acdb_send_voice_cal_t)(int, int);
+typedef int (*acdb_reload_vocvoltable_t)(int);
+
+struct platform_data {
+    struct audio_device *adev;
+    bool fluence_in_spkr_mode;
+    bool fluence_in_voice_call;
+    bool fluence_in_voice_rec;
+    bool fluence_in_audio_rec;
+    int  fluence_type;
+    int  fluence_mode;
+    char fluence_cap[PROPERTY_VALUE_MAX];
+    int  btsco_sample_rate;
+    bool slowtalk;
+    bool is_i2s_ext_modem;
+    /* Audio calibration related functions */
+    void                       *acdb_handle;
+    int                        voice_feature_set;
+    acdb_init_t                acdb_init;
+    acdb_deallocate_t          acdb_deallocate;
+    acdb_send_audio_cal_t      acdb_send_audio_cal;
+    acdb_send_voice_cal_t      acdb_send_voice_cal;
+    acdb_reload_vocvoltable_t  acdb_reload_vocvoltable;
+
+    void *hw_info;
+    struct csd_data *csd;
 };
 
 static const int pcm_device_table[AUDIO_USECASE_MAX][2] = {
@@ -133,7 +174,7 @@ static const int pcm_device_table[AUDIO_USECASE_MAX][2] = {
 };
 
 /* Array to store sound devices */
-static char * device_table[SND_DEVICE_MAX] = {
+static const char * const device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_NONE] = "none",
     /* Playback sound devices */
     [SND_DEVICE_OUT_HANDSET] = "handset",
@@ -162,9 +203,6 @@ static char * device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_OUT_SPEAKER_AND_ANC_HEADSET] = "speaker-and-anc-headphones",
     [SND_DEVICE_OUT_ANC_HANDSET] = "anc-handset",
     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = "speaker-protected",
-    [SND_DEVICE_OUT_VOIP_HANDSET] = "voip-handset-comm",
-    [SND_DEVICE_OUT_VOIP_SPEAKER] = "voip-speaker-comm",
-    [SND_DEVICE_OUT_VOIP_HEADPHONES] = "voip-headset-comm",
 
     /* Capture sound devices */
     [SND_DEVICE_IN_HANDSET_MIC] = "handset-mic",
@@ -208,9 +246,11 @@ static char * device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_IN_HANDSET_STEREO_DMIC] = "handset-stereo-dmic-ef",
     [SND_DEVICE_IN_SPEAKER_STEREO_DMIC] = "speaker-stereo-dmic-ef",
     [SND_DEVICE_IN_CAPTURE_VI_FEEDBACK] = "vi-feedback",
-    [SND_DEVICE_IN_VOIP_HANDSET_MIC] = "voip-main-mic-comm",
-    [SND_DEVICE_IN_VOIP_SPEAKER_MIC] = "voip-sub-mic-comm",
-    [SND_DEVICE_IN_VOIP_HEADSET_MIC] = "voip-headset-mic-comm",
+    [SND_DEVICE_IN_VOICE_SPEAKER_DMIC_BROADSIDE] = "voice-speaker-dmic-broadside",
+    [SND_DEVICE_IN_SPEAKER_DMIC_BROADSIDE] = "speaker-dmic-broadside",
+    [SND_DEVICE_IN_SPEAKER_DMIC_AEC_BROADSIDE] = "speaker-dmic-broadside",
+    [SND_DEVICE_IN_SPEAKER_DMIC_NS_BROADSIDE] = "speaker-dmic-broadside",
+    [SND_DEVICE_IN_SPEAKER_DMIC_AEC_NS_BROADSIDE] = "speaker-dmic-broadside",
 };
 
 /* ACDB IDs (audio DSP path configuration IDs) for each sound device */
@@ -284,6 +324,11 @@ static int acdb_device_table[SND_DEVICE_MAX] = {
     [SND_DEVICE_IN_HANDSET_STEREO_DMIC] = 34,
     [SND_DEVICE_IN_SPEAKER_STEREO_DMIC] = 35,
     [SND_DEVICE_IN_CAPTURE_VI_FEEDBACK] = 102,
+    [SND_DEVICE_IN_VOICE_SPEAKER_DMIC_BROADSIDE] = 12,
+    [SND_DEVICE_IN_SPEAKER_DMIC_BROADSIDE] = 12,
+    [SND_DEVICE_IN_SPEAKER_DMIC_AEC_BROADSIDE] = 119,
+    [SND_DEVICE_IN_SPEAKER_DMIC_NS_BROADSIDE] = 121,
+    [SND_DEVICE_IN_SPEAKER_DMIC_AEC_NS_BROADSIDE] = 120,
 };
 
 struct snd_device_index {
@@ -321,9 +366,6 @@ struct snd_device_index snd_device_name_index[SND_DEVICE_MAX] = {
     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_AND_ANC_HEADSET)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_ANC_HANDSET)},
     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_PROTECTED)},
-    {TO_NAME_INDEX(SND_DEVICE_OUT_VOIP_HANDSET)},
-    {TO_NAME_INDEX(SND_DEVICE_OUT_VOIP_SPEAKER)},
-    {TO_NAME_INDEX(SND_DEVICE_OUT_VOIP_HEADPHONES)},
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC_AEC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC_NS)},
@@ -365,15 +407,17 @@ struct snd_device_index snd_device_name_index[SND_DEVICE_MAX] = {
     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_STEREO_DMIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_SPEAKER_STEREO_DMIC)},
     {TO_NAME_INDEX(SND_DEVICE_IN_CAPTURE_VI_FEEDBACK)},
-    {TO_NAME_INDEX(SND_DEVICE_IN_VOIP_HANDSET_MIC)},
-    {TO_NAME_INDEX(SND_DEVICE_IN_VOIP_SPEAKER_MIC)},
-    {TO_NAME_INDEX(SND_DEVICE_IN_VOIP_HEADSET_MIC)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_VOICE_SPEAKER_DMIC_BROADSIDE)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_SPEAKER_DMIC_BROADSIDE)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_SPEAKER_DMIC_AEC_BROADSIDE)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_SPEAKER_DMIC_NS_BROADSIDE)},
+    {TO_NAME_INDEX(SND_DEVICE_IN_SPEAKER_DMIC_AEC_NS_BROADSIDE)},
 };
 
 #define DEEP_BUFFER_PLATFORM_DELAY (29*1000LL)
 #define LOW_LATENCY_PLATFORM_DELAY (13*1000LL)
 
-int set_echo_reference(struct mixer *mixer, const char* ec_ref)
+static int set_echo_reference(struct mixer *mixer, const char* ec_ref)
 {
     struct mixer_ctl *ctl;
     const char *mixer_ctl_name = "EC_REF_RX";
@@ -389,7 +433,7 @@ int set_echo_reference(struct mixer *mixer, const char* ec_ref)
     return 0;
 }
 
-static struct csd_data *open_csd_client()
+static struct csd_data *open_csd_client(bool i2s_ext_modem)
 {
     struct csd_data *csd = calloc(1, sizeof(struct csd_data));
 
@@ -491,6 +535,16 @@ static struct csd_data *open_csd_client()
                   __func__, dlerror());
             goto error;
         }
+
+        csd->get_sample_rate = (get_sample_rate_t)dlsym(csd->csd_client,
+                                             "csd_client_get_sample_rate");
+        if (csd->get_sample_rate == NULL) {
+            ALOGE("%s: dlsym error %s for csd_client_get_sample_rate",
+                  __func__, dlerror());
+
+            goto error;
+        }
+
         csd->init = (init_t)dlsym(csd->csd_client, "csd_client_init");
 
         if (csd->init == NULL) {
@@ -498,7 +552,7 @@ static struct csd_data *open_csd_client()
                   __func__, dlerror());
             goto error;
         } else {
-            csd->init();
+            csd->init(i2s_ext_modem);
         }
     }
     return csd;
@@ -519,11 +573,44 @@ void close_csd_client(struct csd_data *csd)
     }
 }
 
+static void platform_csd_init(struct platform_data *plat_data)
+{
+    struct dev_info mdm_detect_info;
+    int ret = 0;
+
+    /* Call ESOC API to get the number of modems.
+     * If the number of modems is not zero, load CSD Client specific
+     * symbols. Voice call is handled by MDM and apps processor talks to
+     * MDM through CSD Client
+     */
+    ret = get_system_info(&mdm_detect_info);
+    if (ret > 0) {
+        ALOGE("%s: Failed to get system info, ret %d", __func__, ret);
+    }
+    ALOGD("%s: num_modems %d\n", __func__, mdm_detect_info.num_modems);
+
+    if (mdm_detect_info.num_modems > 0)
+        plat_data->csd = open_csd_client(plat_data->is_i2s_ext_modem);
+}
+
+static bool platform_is_i2s_ext_modem(const char *snd_card_name,
+                                      struct platform_data *plat_data)
+{
+    plat_data->is_i2s_ext_modem = false;
+
+    if (!strncmp(snd_card_name, "apq8084-taiko-i2s-mtp-snd-card",
+                 sizeof("apq8084-taiko-i2s-mtp-snd-card")) ||
+        !strncmp(snd_card_name, "apq8084-taiko-i2s-cdp-snd-card",
+                 sizeof("apq8084-taiko-i2s-cdp-snd-card"))) {
+        plat_data->is_i2s_ext_modem = true;
+    }
+    ALOGV("%s, is_i2s_ext_modem:%d",__func__, plat_data->is_i2s_ext_modem);
+
+    return plat_data->is_i2s_ext_modem;
+}
+
 void *platform_init(struct audio_device *adev)
 {
-    custom_init_data();
-    char platform[PROPERTY_VALUE_MAX];
-    char baseband[PROPERTY_VALUE_MAX];
     char value[PROPERTY_VALUE_MAX];
     struct platform_data *my_data = NULL;
     int retry_num = 0, snd_card_num = 0;
@@ -555,10 +642,16 @@ void *platform_init(struct audio_device *adev)
         if (!my_data->hw_info) {
             ALOGE("%s: Failed to init hardware info", __func__);
         } else {
-            if (audio_extn_read_xml(adev, snd_card_num, MIXER_XML_PATH,
-                                    MIXER_XML_PATH_AUXPCM) == -ENOSYS)
+            if (platform_is_i2s_ext_modem(snd_card_name, my_data)) {
+                ALOGD("%s: Call MIXER_XML_PATH_I2S", __func__);
+
+                adev->audio_route = audio_route_init(snd_card_num,
+                                                     MIXER_XML_PATH_I2S);
+            } else if (audio_extn_read_xml(adev, snd_card_num, MIXER_XML_PATH,
+                                    MIXER_XML_PATH_AUXPCM) == -ENOSYS) {
                 adev->audio_route = audio_route_init(snd_card_num,
                                                  MIXER_XML_PATH);
+            }
             if (!adev->audio_route) {
                 ALOGE("%s: Failed to init audio route controls, aborting.",
                        __func__);
@@ -586,11 +679,12 @@ void *platform_init(struct audio_device *adev)
     my_data->fluence_in_voice_rec = false;
     my_data->fluence_in_audio_rec = false;
     my_data->fluence_type = FLUENCE_NONE;
+    my_data->fluence_mode = FLUENCE_ENDFIRE;
 
-    property_get("ro.qc.sdk.audio.fluencetype", value, "");
-    if (!strncmp("fluencepro", value, sizeof("fluencepro"))) {
+    property_get("ro.qc.sdk.audio.fluencetype", my_data->fluence_cap, "");
+    if (!strncmp("fluencepro", my_data->fluence_cap, sizeof("fluencepro"))) {
         my_data->fluence_type = FLUENCE_QUAD_MIC | FLUENCE_DUAL_MIC;
-    } else if (!strncmp("fluence", value, sizeof("fluence"))) {
+    } else if (!strncmp("fluence", my_data->fluence_cap, sizeof("fluence"))) {
         my_data->fluence_type = FLUENCE_DUAL_MIC;
     } else {
         my_data->fluence_type = FLUENCE_NONE;
@@ -615,6 +709,11 @@ void *platform_init(struct audio_device *adev)
         property_get("persist.audio.fluence.speaker",value,"");
         if (!strncmp("true", value, sizeof("true"))) {
             my_data->fluence_in_spkr_mode = true;
+        }
+
+        property_get("persist.audio.fluence.mode",value,"");
+        if (!strncmp("broadside", value, sizeof("broadside"))) {
+            my_data->fluence_mode = FLUENCE_BROADSIDE;
         }
     }
 
@@ -649,26 +748,21 @@ void *platform_init(struct audio_device *adev)
                   __func__, LIB_ACDB_LOADER);
 
         my_data->acdb_init = (acdb_init_t)dlsym(my_data->acdb_handle,
-                                                    "acdb_loader_init_ACDB");
+                                                    "acdb_loader_init_v2");
         if (my_data->acdb_init == NULL)
-            ALOGE("%s: dlsym error %s for acdb_loader_init_ACDB", __func__, dlerror());
+            ALOGE("%s: dlsym error %s for acdb_loader_init_v2", __func__, dlerror());
         else
-            my_data->acdb_init();
+            my_data->acdb_init(snd_card_name);
     }
 
     /* Initialize ACDB ID's */
-    platform_info_init();
+    if (my_data->is_i2s_ext_modem)
+        platform_info_init(PLATFORM_INFO_XML_PATH_I2S);
+    else
+        platform_info_init(PLATFORM_INFO_XML_PATH);
 
-    /* If platform is apq8084 and baseband is MDM, load CSD Client specific
-     * symbols. Voice call is handled by MDM and apps processor talks to
-     * MDM through CSD Client
-     */
-    property_get("ro.board.platform", platform, "");
-    property_get("ro.baseband", baseband, "");
-    if (!strncmp("apq8084", platform, sizeof("apq8084")) &&
-        !strncmp("mdm", baseband, sizeof("mdm"))) {
-         my_data->csd = open_csd_client();
-    }
+    /* load csd client */
+    platform_csd_init(my_data);
 
     /* init usb */
     audio_extn_usb_init(adev);
@@ -744,22 +838,13 @@ void platform_add_backend_name(char *mixer_path, snd_device_t snd_device)
         strlcat(mixer_path, " capture-fm", MIXER_PATH_MAX_LENGTH);
     else if (snd_device == SND_DEVICE_OUT_TRANSMISSION_FM)
         strlcat(mixer_path, " transmission-fm", MIXER_PATH_MAX_LENGTH);
-#ifdef SEPARATE_SPKR_BACKEND
-    else if (snd_device == SND_DEVICE_OUT_SPEAKER)
-        strlcat(mixer_path, " speaker", MIXER_PATH_MAX_LENGTH);
-    else if (snd_device == SND_DEVICE_OUT_SPEAKER_REVERSE)
-        strlcat(mixer_path, " speaker-reverse", MIXER_PATH_MAX_LENGTH);
-    else if (snd_device == SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES)
-        strlcat(mixer_path, " speaker-and-headphones", MIXER_PATH_MAX_LENGTH);
-    else if (snd_device == SND_DEVICE_OUT_VOICE_SPEAKER)
-        strlcat(mixer_path, " voice-speaker", MIXER_PATH_MAX_LENGTH);
-    else if (snd_device == SND_DEVICE_OUT_SPEAKER_AND_ANC_HEADSET)
-        strlcat(mixer_path, " speaker-and-anc-headphones", MIXER_PATH_MAX_LENGTH);
-    else if (snd_device == SND_DEVICE_OUT_SPEAKER_PROTECTED)
-        strlcat(mixer_path, " speaker-protected", MIXER_PATH_MAX_LENGTH);
-    else if (snd_device == SND_DEVICE_OUT_VOIP_SPEAKER)
-        strlcat(mixer_path, " voip-speaker-comm", MIXER_PATH_MAX_LENGTH);
-#endif
+    else if (snd_device == SND_DEVICE_OUT_VOICE_SPEAKER &&
+             audio_extn_spkr_prot_is_enabled() ) {
+        char platform[PROPERTY_VALUE_MAX];
+        property_get("ro.board.platform", platform, "");
+        if (!strncmp("apq8084", platform, sizeof("apq8084")))
+            strlcat(mixer_path, " speaker-protected", MIXER_PATH_MAX_LENGTH);
+    }
 }
 
 int platform_get_pcm_device_id(audio_usecase_t usecase, int device_type)
@@ -793,6 +878,63 @@ int platform_get_snd_device_index(char *snd_device_index_name)
             __func__, snd_device_index_name);
     ret = -ENODEV;
 done:
+    return ret;
+}
+
+int platform_set_fluence_type(void *platform, char *value)
+{
+    int ret = 0;
+    int fluence_type = FLUENCE_NONE;
+    int fluence_flag = NONE_FLAG;
+    struct platform_data *my_data = (struct platform_data *)platform;
+    struct audio_device *adev = my_data->adev;
+
+    ALOGV("%s: fluence type:%d", __func__, my_data->fluence_type);
+
+    /* only dual mic turn on and off is supported as of now through setparameters */
+    if (!strncmp(AUDIO_PARAMETER_VALUE_DUALMIC,value, sizeof(AUDIO_PARAMETER_VALUE_DUALMIC))) {
+        if (!strncmp("fluencepro", my_data->fluence_cap, sizeof("fluencepro")) ||
+            !strncmp("fluence", my_data->fluence_cap, sizeof("fluence"))) {
+            ALOGV("fluence dualmic feature enabled \n");
+            fluence_type = FLUENCE_DUAL_MIC;
+            fluence_flag = DMIC_FLAG;
+        } else {
+            ALOGE("%s: Failed to set DUALMIC", __func__);
+            ret = -1;
+            goto done;
+        }
+    } else if (!strncmp(AUDIO_PARAMETER_KEY_NO_FLUENCE, value, sizeof(AUDIO_PARAMETER_KEY_NO_FLUENCE))) {
+        ALOGV("fluence disabled");
+        fluence_type = FLUENCE_NONE;
+    } else {
+        ALOGE("Invalid fluence value : %s",value);
+        ret = -1;
+        goto done;
+    }
+
+    if (fluence_type != my_data->fluence_type) {
+        ALOGV("%s: Updating fluence_type to :%d", __func__, fluence_type);
+        my_data->fluence_type = fluence_type;
+        adev->acdb_settings = (adev->acdb_settings & FLUENCE_MODE_CLEAR) | fluence_flag;
+    }
+done:
+    return ret;
+}
+
+int platform_get_fluence_type(void *platform, char *value, uint32_t len)
+{
+    int ret = 0;
+    struct platform_data *my_data = (struct platform_data *)platform;
+
+    if (my_data->fluence_type == FLUENCE_QUAD_MIC) {
+        strlcpy(value, "quadmic", len);
+    } else if (my_data->fluence_type == FLUENCE_DUAL_MIC) {
+        strlcpy(value, "dualmic", len);
+    } else if (my_data->fluence_type == FLUENCE_NONE) {
+        strlcpy(value, "none", len);
+    } else
+        ret = -1;
+
     return ret;
 }
 
@@ -861,21 +1003,28 @@ int platform_switch_voice_call_enable_device_config(void *platform,
     int acdb_rx_id, acdb_tx_id;
     int ret = 0;
 
-    acdb_rx_id = acdb_device_table[out_snd_device];
+    if (my_data->csd == NULL)
+        return ret;
+
+    if (out_snd_device == SND_DEVICE_OUT_VOICE_SPEAKER &&
+        audio_extn_spkr_prot_is_enabled())
+        acdb_rx_id = acdb_device_table[SND_DEVICE_OUT_SPEAKER_PROTECTED];
+    else
+        acdb_rx_id = acdb_device_table[out_snd_device];
+
     acdb_tx_id = acdb_device_table[in_snd_device];
 
-    if (my_data->csd != NULL) {
-        if (acdb_rx_id > 0 && acdb_tx_id > 0) {
-            ret = my_data->csd->enable_device_config(acdb_rx_id, acdb_tx_id);
-            if (ret < 0) {
-                ALOGE("%s: csd_enable_device_config, failed, error %d",
-                      __func__, ret);
-            }
-        } else {
-            ALOGE("%s: Incorrect ACDB IDs (rx: %d tx: %d)", __func__,
-                  acdb_rx_id, acdb_tx_id);
+    if (acdb_rx_id > 0 && acdb_tx_id > 0) {
+        ret = my_data->csd->enable_device_config(acdb_rx_id, acdb_tx_id);
+        if (ret < 0) {
+            ALOGE("%s: csd_enable_device_config, failed, error %d",
+                  __func__, ret);
         }
+    } else {
+        ALOGE("%s: Incorrect ACDB IDs (rx: %d tx: %d)", __func__,
+              acdb_rx_id, acdb_tx_id);
     }
+
     return ret;
 }
 
@@ -910,22 +1059,28 @@ int platform_switch_voice_call_usecase_route_post(void *platform,
     int acdb_rx_id, acdb_tx_id;
     int ret = 0;
 
-    acdb_rx_id = acdb_device_table[out_snd_device];
+    if (my_data->csd == NULL)
+        return ret;
+
+    if (out_snd_device == SND_DEVICE_OUT_VOICE_SPEAKER &&
+        audio_extn_spkr_prot_is_enabled())
+        acdb_rx_id = acdb_device_table[SND_DEVICE_OUT_SPEAKER_PROTECTED];
+    else
+        acdb_rx_id = acdb_device_table[out_snd_device];
+
     acdb_tx_id = acdb_device_table[in_snd_device];
 
-    if (my_data->csd != NULL) {
-        if (acdb_rx_id > 0 && acdb_tx_id > 0) {
-            ret = my_data->csd->enable_device(acdb_rx_id, acdb_tx_id,
-                                              my_data->adev->acdb_settings);
-            if (ret < 0) {
-                ALOGE("%s: csd_enable_device, failed, error %d",
-                      __func__, ret);
-            }
-        } else {
-            ALOGE("%s: Incorrect ACDB IDs (rx: %d tx: %d)", __func__,
-                  acdb_rx_id, acdb_tx_id);
+    if (acdb_rx_id > 0 && acdb_tx_id > 0) {
+        ret = my_data->csd->enable_device(acdb_rx_id, acdb_tx_id,
+                                          my_data->adev->acdb_settings);
+        if (ret < 0) {
+            ALOGE("%s: csd_enable_device, failed, error %d", __func__, ret);
         }
+    } else {
+        ALOGE("%s: Incorrect ACDB IDs (rx: %d tx: %d)", __func__,
+              acdb_rx_id, acdb_tx_id);
     }
+
     return ret;
 }
 
@@ -952,6 +1107,20 @@ int platform_stop_voice_call(void *platform, uint32_t vsid)
         ret = my_data->csd->stop_voice(vsid);
         if (ret < 0) {
             ALOGE("%s: csd_stop_voice error %d\n", __func__, ret);
+        }
+    }
+    return ret;
+}
+
+int platform_get_sample_rate(void *platform, uint32_t *rate)
+{
+    struct platform_data *my_data = (struct platform_data *)platform;
+    int ret = 0;
+
+    if ((my_data->csd != NULL) && my_data->is_i2s_ext_modem) {
+        ret = my_data->csd->get_sample_rate(rate);
+        if (ret < 0) {
+            ALOGE("%s: csd_get_sample_rate error %d\n", __func__, ret);
         }
     }
     return ret;
@@ -1021,6 +1190,44 @@ int platform_set_mic_mute(void *platform, bool state)
             ALOGE("%s: csd_mic_mute error %d", __func__, ret);
         }
     }
+    return ret;
+}
+
+int platform_set_device_mute(void *platform, bool state, char *dir)
+{
+    struct platform_data *my_data = (struct platform_data *)platform;
+    struct audio_device *adev = my_data->adev;
+    struct mixer_ctl *ctl;
+    char *mixer_ctl_name = NULL;
+    int ret = 0;
+    uint32_t set_values[ ] = {0,
+                              ALL_SESSION_VSID,
+                              0};
+    if(dir == NULL) {
+        ALOGE("%s: Invalid direction:%s", __func__, dir);
+        return -EINVAL;
+    }
+
+    if (!strncmp("rx", dir, sizeof("rx"))) {
+        mixer_ctl_name = "Voice Rx Device Mute";
+    } else if (!strncmp("tx", dir, sizeof("tx"))) {
+        mixer_ctl_name = "Voice Tx Device Mute";
+    } else {
+        return -EINVAL;
+    }
+
+    set_values[0] = state;
+    ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+    if (!ctl) {
+        ALOGE("%s: Could not get ctl for mixer cmd - %s",
+              __func__, mixer_ctl_name);
+        return -EINVAL;
+    }
+
+    ALOGV("%s: Setting device mute state: %d, mixer ctrl:%s",
+          __func__,state, mixer_ctl_name);
+    mixer_ctl_set_array(ctl, set_values, ARRAY_SIZE(set_values));
+
     return ret;
 }
 
@@ -1098,12 +1305,7 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
                 else
                     snd_device = SND_DEVICE_OUT_VOICE_ANC_HEADSET;
             } else {
-                if (voice_extn_compress_voip_is_active(adev) &&
-                        voice_extn_dedicated_voip_device_prop_check()) {
-                    snd_device = SND_DEVICE_OUT_VOIP_HEADPHONES;
-                } else {
-                    snd_device = SND_DEVICE_OUT_VOICE_HEADPHONES;
-                }
+                snd_device = SND_DEVICE_OUT_VOICE_HEADPHONES;
             }
         } else if (devices & AUDIO_DEVICE_OUT_ALL_SCO) {
             if (my_data->btsco_sample_rate == SAMPLE_RATE_16KHZ)
@@ -1111,12 +1313,7 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
             else
                 snd_device = SND_DEVICE_OUT_BT_SCO;
         } else if (devices & AUDIO_DEVICE_OUT_SPEAKER) {
-            if (voice_extn_compress_voip_is_active(adev) &&
-                    voice_extn_dedicated_voip_device_prop_check()) {
-                snd_device = SND_DEVICE_OUT_VOIP_SPEAKER;
-            } else {
-                snd_device = SND_DEVICE_OUT_VOICE_SPEAKER;
-            }
+            snd_device = SND_DEVICE_OUT_VOICE_SPEAKER;
         } else if (devices & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET ||
                    devices & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET) {
             snd_device = SND_DEVICE_OUT_USB_HEADSET;
@@ -1125,9 +1322,6 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
         } else if (devices & AUDIO_DEVICE_OUT_EARPIECE) {
             if (audio_extn_should_use_handset_anc(channel_count))
                 snd_device = SND_DEVICE_OUT_ANC_HANDSET;
-            else if (voice_extn_compress_voip_is_active(adev) &&
-                    voice_extn_dedicated_voip_device_prop_check())
-                snd_device = SND_DEVICE_OUT_VOIP_HANDSET;
             else
                 snd_device = SND_DEVICE_OUT_VOICE_HANDSET;
         }
@@ -1183,11 +1377,6 @@ exit:
 
 snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_device)
 {
-    snd_device_t customdata = custom_platform_get_input_snd_device(platform, out_device);
-    if (customdata!=-2) {
-        ALOGE("entering custom CM abstraction");
-        return customdata;
-    }
     struct platform_data *my_data = (struct platform_data *)platform;
     struct audio_device *adev = my_data->adev;
     audio_source_t  source = (adev->active_input == NULL) ?
@@ -1232,6 +1421,7 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
             if (out_device & AUDIO_DEVICE_OUT_EARPIECE &&
                 audio_extn_should_use_handset_anc(channel_count)) {
                 snd_device = SND_DEVICE_IN_AANC_HANDSET_MIC;
+                adev->acdb_settings |= ANC_FLAG;
             } else if (my_data->fluence_type == FLUENCE_NONE ||
                 my_data->fluence_in_voice_call == false) {
                 snd_device = SND_DEVICE_IN_HANDSET_MIC;
@@ -1256,7 +1446,10 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
                     snd_device = SND_DEVICE_IN_VOICE_SPEAKER_QMIC;
                 } else {
                     adev->acdb_settings |= DMIC_FLAG;
-                    snd_device = SND_DEVICE_IN_VOICE_SPEAKER_DMIC;
+                    if (my_data->fluence_mode == FLUENCE_BROADSIDE)
+                       snd_device = SND_DEVICE_IN_VOICE_SPEAKER_DMIC_BROADSIDE;
+                    else
+                       snd_device = SND_DEVICE_IN_VOICE_SPEAKER_DMIC;
                 }
             } else {
                 snd_device = SND_DEVICE_IN_VOICE_SPEAKER_MIC;
@@ -1286,20 +1479,15 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
         if (out_device & AUDIO_DEVICE_OUT_SPEAKER)
             in_device = AUDIO_DEVICE_IN_BACK_MIC;
         if (adev->active_input) {
-            if (voice_extn_dedicated_voip_device_prop_check()) {
-                if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
-                    snd_device = SND_DEVICE_IN_VOIP_SPEAKER_MIC;
-                } else if (in_device & AUDIO_DEVICE_IN_BUILTIN_MIC) {
-                    snd_device = SND_DEVICE_IN_VOIP_HANDSET_MIC;
-                } else if (in_device & AUDIO_DEVICE_IN_WIRED_HEADSET) {
-                    snd_device = SND_DEVICE_IN_VOIP_HEADSET_MIC;
-                }
-            } else if (adev->active_input->enable_aec &&
+            if (adev->active_input->enable_aec &&
                     adev->active_input->enable_ns) {
                 if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
                     if (my_data->fluence_type & FLUENCE_DUAL_MIC &&
                        my_data->fluence_in_spkr_mode) {
-                        snd_device = SND_DEVICE_IN_SPEAKER_DMIC_AEC_NS;
+                        if (my_data->fluence_mode == FLUENCE_BROADSIDE)
+                            snd_device = SND_DEVICE_IN_SPEAKER_DMIC_AEC_NS_BROADSIDE;
+                        else
+                            snd_device = SND_DEVICE_IN_SPEAKER_DMIC_AEC_NS;
                         adev->acdb_settings |= DMIC_FLAG;
                     } else
                         snd_device = SND_DEVICE_IN_SPEAKER_MIC_AEC_NS;
@@ -1315,8 +1503,12 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
                 set_echo_reference(adev->mixer, EC_REF_RX);
             } else if (adev->active_input->enable_aec) {
                 if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
-                    if (my_data->fluence_type & FLUENCE_DUAL_MIC) {
-                        snd_device = SND_DEVICE_IN_SPEAKER_DMIC_AEC;
+                    if (my_data->fluence_type & FLUENCE_DUAL_MIC &&
+                        my_data->fluence_in_spkr_mode) {
+                        if (my_data->fluence_mode == FLUENCE_BROADSIDE)
+                            snd_device = SND_DEVICE_IN_SPEAKER_DMIC_AEC_BROADSIDE;
+                        else
+                            snd_device = SND_DEVICE_IN_SPEAKER_DMIC_AEC;
                         adev->acdb_settings |= DMIC_FLAG;
                     } else
                         snd_device = SND_DEVICE_IN_SPEAKER_MIC_AEC;
@@ -1332,8 +1524,12 @@ snd_device_t platform_get_input_snd_device(void *platform, audio_devices_t out_d
                 set_echo_reference(adev->mixer, EC_REF_RX);
             } else if (adev->active_input->enable_ns) {
                 if (in_device & AUDIO_DEVICE_IN_BACK_MIC) {
-                    if (my_data->fluence_type & FLUENCE_DUAL_MIC) {
-                        snd_device = SND_DEVICE_IN_SPEAKER_DMIC_NS;
+                    if (my_data->fluence_type & FLUENCE_DUAL_MIC &&
+                        my_data->fluence_in_spkr_mode) {
+                        if (my_data->fluence_mode == FLUENCE_BROADSIDE)
+                            snd_device = SND_DEVICE_IN_SPEAKER_DMIC_NS_BROADSIDE;
+                        else
+                            snd_device = SND_DEVICE_IN_SPEAKER_DMIC_NS;
                         adev->acdb_settings |= DMIC_FLAG;
                     } else
                         snd_device = SND_DEVICE_IN_SPEAKER_MIC_NS;
@@ -1703,24 +1899,8 @@ void platform_get_parameters(void *platform,
     char *str = NULL;
     char value[256] = {0};
     int ret;
-    int fluence_type;
     char *kv_pairs = NULL;
 
-    ret = str_parms_get_str(query, AUDIO_PARAMETER_KEY_FLUENCE_TYPE,
-                            value, sizeof(value));
-    if (ret >= 0) {
-        if (my_data->fluence_type & FLUENCE_QUAD_MIC) {
-            strlcpy(value, "fluencepro", sizeof(value));
-        } else if (my_data->fluence_type & FLUENCE_DUAL_MIC) {
-            strlcpy(value, "fluence", sizeof(value));
-        } else {
-            strlcpy(value, "none", sizeof(value));
-        }
-
-        str_parms_add_str(reply, AUDIO_PARAMETER_KEY_FLUENCE_TYPE, value);
-    }
-
-    memset(value, 0, sizeof(value));
     ret = str_parms_get_str(query, AUDIO_PARAMETER_KEY_SLOWTALK,
                             value, sizeof(value));
     if (ret >= 0) {
@@ -1775,16 +1955,6 @@ bool platform_listen_update_status(snd_device_t snd_device)
         return true;
     else
         return false;
-}
-void change_acdb_data(int key, int value){
-    //ALOGE("%s: shareefdebug :%d", "acdb_device_table[key]",  acdb_device_table[key]);
-    acdb_device_table[key]=value;
-    // ALOGE("%s: shareefdebug :%d", "acdb_device_table[key]",  acdb_device_table[key]);
-}
-void change_table_data(int key, char value[]){
-    //ALOGE("%s: shareefdebug :%s", "device_table[key]", device_table[key]);
-    device_table[key] = value;
-    //ALOGE("%s: shareefdebug :%s", "device_table[key]", device_table[key]);
 }
 
 /* Read  offload buffer size from a property.
@@ -1851,3 +2021,4 @@ uint32_t platform_get_pcm_offload_buffer_size(audio_offload_info_t* info)
     ALOGV("%s: fragment_size %d", __func__, fragment_size);
     return fragment_size;
 }
+

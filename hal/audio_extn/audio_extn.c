@@ -28,6 +28,8 @@
 
 #include "audio_hw.h"
 #include "audio_extn.h"
+#include "platform.h"
+#include "platform_api.h"
 
 #define MAX_SLEEP_RETRY 100
 #define WIFI_INIT_WAIT_SLEEP 50
@@ -35,18 +37,22 @@
 struct audio_extn_module {
     bool anc_enabled;
     bool aanc_enabled;
+    bool custom_stereo_enabled;
     uint32_t proxy_channel_num;
 };
 
 static struct audio_extn_module aextnmod = {
     .anc_enabled = 0,
     .aanc_enabled = 0,
+    .custom_stereo_enabled = 0,
     .proxy_channel_num = 2,
 };
 
 #define AUDIO_PARAMETER_KEY_ANC        "anc_enabled"
 #define AUDIO_PARAMETER_KEY_WFD        "wfd_channel_cap"
 #define AUDIO_PARAMETER_CAN_OPEN_PROXY "can_open_proxy"
+#define AUDIO_PARAMETER_CUSTOM_STEREO  "stereo_as_dual_mono"
+
 #ifndef FM_ENABLED
 #define audio_extn_fm_set_parameters(adev, parms) (0)
 #else
@@ -54,11 +60,50 @@ void audio_extn_fm_set_parameters(struct audio_device *adev,
                                    struct str_parms *parms);
 #endif
 #ifndef HFP_ENABLED
-#define audio_extn_hfp_set_parameters(adev, parms) (0)
+void audio_extn_hfp_set_parameters(adev, parms) (0)
 #else
 void audio_extn_hfp_set_parameters(struct audio_device *adev,
                                            struct str_parms *parms);
 #endif
+
+#ifndef CUSTOM_STEREO_ENABLED
+#define audio_extn_customstereo_set_parameters(adev, parms)         (0)
+#else
+void audio_extn_customstereo_set_parameters(struct audio_device *adev,
+                                           struct str_parms *parms)
+{
+    int ret = 0;
+    char value[32]={0};
+    bool custom_stereo_state = false;
+    const char *mixer_ctl_name = "Set Custom Stereo OnOff";
+    struct mixer_ctl *ctl;
+
+    ALOGV("%s", __func__);
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_CUSTOM_STEREO, value,
+                            sizeof(value));
+    if (ret >= 0) {
+        if (!strncmp("true", value, sizeof("true")) || atoi(value))
+            custom_stereo_state = true;
+
+        if (custom_stereo_state == aextnmod.custom_stereo_enabled)
+            return;
+
+        ctl = mixer_get_ctl_by_name(adev->mixer, mixer_ctl_name);
+        if (!ctl) {
+            ALOGE("%s: Could not get ctl for mixer cmd - %s",
+                  __func__, mixer_ctl_name);
+            return;
+        }
+        if (mixer_ctl_set_value(ctl, 0, custom_stereo_state) < 0) {
+            ALOGE("%s: Could not set custom stereo state %d",
+                  __func__, custom_stereo_state);
+            return;
+        }
+        aextnmod.custom_stereo_enabled = custom_stereo_state;
+        ALOGV("%s: Setting custom stereo state success", __func__);
+    }
+}
+#endif /* CUSTOM_STEREO_ENABLED */
 
 #ifndef ANC_HEADSET_ENABLED
 #define audio_extn_set_anc_parameters(adev, parms)       (0)
@@ -130,8 +175,62 @@ void audio_extn_set_anc_parameters(struct audio_device *adev,
 }
 #endif /* ANC_HEADSET_ENABLED */
 
+#ifndef FLUENCE_ENABLED
+#define audio_extn_set_fluence_parameters(adev, parms) (0)
+#define audio_extn_get_fluence_parameters(adev, query, reply) (0)
+#else
+void audio_extn_set_fluence_parameters(struct audio_device *adev,
+                                            struct str_parms *parms)
+{
+    int ret = 0, err;
+    char value[32];
+    struct listnode *node;
+    struct audio_usecase *usecase;
+
+    err = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_FLUENCE,
+                                 value, sizeof(value));
+    ALOGV_IF(err >= 0, "%s: Set Fluence Type to %s", __func__, value);
+    if (err >= 0) {
+        ret = platform_set_fluence_type(adev->platform, value);
+        if (ret != 0) {
+            ALOGE("platform_set_fluence_type returned error: %d", ret);
+        } else {
+            /*
+             *If the fluence is manually set/reset, devices
+             *need to get updated for all the usecases
+             *i.e. audio and voice.
+             */
+             list_for_each(node, &adev->usecase_list) {
+                 usecase = node_to_item(node, struct audio_usecase, list);
+                 select_devices(adev, usecase->id);
+             }
+        }
+    }
+}
+
+int audio_extn_get_fluence_parameters(struct audio_device *adev,
+                       struct str_parms *query, struct str_parms *reply)
+{
+    int ret = 0, err;
+    char value[256] = {0};
+
+    err = str_parms_get_str(query, AUDIO_PARAMETER_KEY_FLUENCE, value,
+                                                          sizeof(value));
+    if (err >= 0) {
+        ret = platform_get_fluence_type(adev->platform, value, sizeof(value));
+        if (ret >= 0) {
+            ALOGV("%s: Fluence Type is %s", __func__, value);
+            str_parms_add_str(reply, AUDIO_PARAMETER_KEY_FLUENCE, value);
+        } else
+            goto done;
+    }
+done:
+    return ret;
+}
+#endif /* FLUENCE_ENABLED */
+
 #ifndef AFE_PROXY_ENABLED
-#define audio_extn_set_afe_proxy_parameters(adev, parms)  (0)
+#define audio_extn_set_afe_proxy_parameters(parms)        (0)
 #define audio_extn_get_afe_proxy_parameters(query, reply) (0)
 #else
 /* Front left channel. */
@@ -253,8 +352,7 @@ int32_t audio_extn_set_afe_proxy_channel_mixer(struct audio_device *adev,
     return ret;
 }
 
-void audio_extn_set_afe_proxy_parameters(struct audio_device *adev,
-                                         struct str_parms *parms)
+void audio_extn_set_afe_proxy_parameters(struct str_parms *parms)
 {
     int ret, val;
     char value[32]={0};
@@ -264,7 +362,6 @@ void audio_extn_set_afe_proxy_parameters(struct audio_device *adev,
     if (ret >= 0) {
         val = atoi(value);
         aextnmod.proxy_channel_num = val;
-        adev->cur_wfd_channels = val;
         ALOGD("%s: channel capability set to: %d", __func__,
                aextnmod.proxy_channel_num);
     }
@@ -329,11 +426,13 @@ void audio_extn_set_parameters(struct audio_device *adev,
                                struct str_parms *parms)
 {
    audio_extn_set_anc_parameters(adev, parms);
-   audio_extn_set_afe_proxy_parameters(adev, parms);
+   audio_extn_set_fluence_parameters(adev, parms);
+   audio_extn_set_afe_proxy_parameters(parms);
    audio_extn_fm_set_parameters(adev, parms);
    audio_extn_listen_set_parameters(adev, parms);
    audio_extn_hfp_set_parameters(adev, parms);
    audio_extn_ddp_set_parameters(adev, parms);
+   audio_extn_customstereo_set_parameters(adev, parms);
 }
 
 void audio_extn_get_parameters(const struct audio_device *adev,
@@ -342,6 +441,7 @@ void audio_extn_get_parameters(const struct audio_device *adev,
 {
     char *kv_pairs = NULL;
     audio_extn_get_afe_proxy_parameters(query, reply);
+    audio_extn_get_fluence_parameters(adev, query, reply);
 
     kv_pairs = str_parms_to_str(reply);
     ALOGD_IF(kv_pairs != NULL, "%s: returns %s", __func__, kv_pairs);

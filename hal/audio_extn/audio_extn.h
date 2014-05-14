@@ -39,6 +39,16 @@ bool audio_extn_should_use_fb_anc(void);
 bool audio_extn_should_use_handset_anc(int in_channels);
 #endif
 
+#ifndef FLUENCE_ENABLED
+#define audio_extn_set_fluence_parameters(adev, parms) (0)
+#define audio_extn_get_fluence_parameters(adev, query, reply) (0)
+#else
+void audio_extn_set_fluence_parameters(struct audio_device *adev,
+                                           struct str_parms *parms);
+int audio_extn_get_fluence_parameters(struct audio_device *adev,
+                  struct str_parms *query, struct str_parms *reply);
+#endif
+
 #ifndef AFE_PROXY_ENABLED
 #define audio_extn_set_afe_proxy_channel_mixer(adev,channel_count)     (0)
 #define audio_extn_read_afe_proxy_channel_masks(out)                   (0)
@@ -57,7 +67,7 @@ int32_t audio_extn_get_afe_proxy_channel_count();
 #define audio_extn_usb_start_playback(adev)              (0)
 #define audio_extn_usb_stop_playback()                   (0)
 #define audio_extn_usb_start_capture(adev)               (0)
-#define audio_extn_usb_stop_capture(adev)                (0)
+#define audio_extn_usb_stop_capture()                    (0)
 #define audio_extn_usb_set_proxy_sound_card(sndcard_idx) (0)
 #define audio_extn_usb_is_proxy_inuse()                  (0)
 #else
@@ -66,7 +76,7 @@ void audio_extn_usb_deinit();
 void audio_extn_usb_start_playback(void *adev);
 void audio_extn_usb_stop_playback();
 void audio_extn_usb_start_capture(void *adev);
-void audio_extn_usb_stop_capture(void *adev);
+void audio_extn_usb_stop_capture();
 void audio_extn_usb_set_proxy_sound_card(uint32_t sndcard_idx);
 bool audio_extn_usb_is_proxy_inuse();
 #endif
@@ -166,7 +176,7 @@ void audio_extn_dolby_set_dmid(struct audio_device *adev);
 #endif
 
 #ifndef DS1_DOLBY_DDP_ENABLED
-#define audio_extn_dolby_set_endpoint(adev)             (0)
+#define audio_extn_dolby_set_endpoint(adev)                 (0)
 #else
 void audio_extn_dolby_set_endpoint(struct audio_device *adev);
 #endif
@@ -188,10 +198,8 @@ void audio_extn_dolby_send_ddp_endp_params(struct audio_device *adev);
 
 #ifndef HFP_ENABLED
 #define audio_extn_hfp_is_active(adev)                  (0)
-#define audio_extn_hfp_get_usecase()                    (0)
 #else
 bool audio_extn_hfp_is_active(struct audio_device *adev);
-audio_usecase_t audio_extn_hfp_get_usecase();
 #endif
 
 #endif /* AUDIO_EXTN_H */
